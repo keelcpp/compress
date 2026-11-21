@@ -30,7 +30,7 @@ struct InflateOptions {
 
 // RFC 1951 raw Deflate compression.
 // level == 0 emits stored uncompressed blocks; level 1..9 uses LZ77 + Fixed Huffman.
-[[nodiscard]] Array<u8> deflate_raw(ArrayRef<u8> src, int level = 6, Allocator* alloc = nullptr);
+[[nodiscard]] Array<u8> deflate_raw(ArrayRef<u8> src, i32 level = 6, Allocator* alloc = nullptr);
 
 // RFC 1950 ZLIB stream decompression (2-byte header + Deflate payload + 4-byte Adler-32).
 // Possible error codes:
@@ -41,6 +41,6 @@ struct InflateOptions {
 [[nodiscard]] Result<Array<u8>> zlib_decompress(ArrayRef<u8> src, const InflateOptions& opts = {});
 
 // RFC 1950 ZLIB stream compression (2-byte header + Deflate payload + 4-byte big-endian Adler-32).
-[[nodiscard]] Array<u8> zlib_compress(ArrayRef<u8> src, int level = 6, Allocator* alloc = nullptr);
+[[nodiscard]] Array<u8> zlib_compress(ArrayRef<u8> src, i32 level = 6, Allocator* alloc = nullptr);
 
 } // namespace keel::compress

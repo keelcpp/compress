@@ -14,7 +14,7 @@ consteval Crc32Table make_crc32_table() noexcept {
     Crc32Table tbl{};
     for (u32 i = 0; i < 256; ++i) {
         u32 c = i;
-        for (int k = 0; k < 8; ++k) {
+        for (i32 k = 0; k < 8; ++k) {
             c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
         }
         tbl.entries[i] = c;
@@ -28,7 +28,7 @@ class BitReader {
 public:
     BitReader(const u8* src, usize len) noexcept : m_data(src), m_len(len) {}
 
-    [[nodiscard]] bool read_bits(int n, u32& out) noexcept {
+    [[nodiscard]] bool read_bits(i32 n, u32& out) noexcept {
         KEEL_ASSERT(n >= 0 && n <= 24);
         while (m_bit_count < n) {
             if (m_pos >= m_len) [[unlikely]] {
@@ -72,25 +72,25 @@ private:
     usize m_len = 0;
     usize m_pos = 0;
     u32 m_bit_buf = 0;
-    int m_bit_count = 0;
+    i32 m_bit_count = 0;
 };
 
 struct HuffmanTree {
-    static constexpr int kMaxBits = 15;
+    static constexpr i32 kMaxBits = 15;
 
     ArenaArray<i16> nodes; // left = 2*node, right = 2*node + 1; negative = -(symbol + 1), 0 = unassigned
 
     explicit HuffmanTree(Arena& scratch) : nodes(scratch, 576) {}
 
-    [[nodiscard]] ErrorCode build(const u8* lens, int count) {
+    [[nodiscard]] ErrorCode build(const u8* lens, i32 count) {
         nodes.clear();
         nodes.push_back(0);
         nodes.push_back(0);
 
-        int max_len = 0;
-        int bl_count[kMaxBits + 1] = {};
-        for (int i = 0; i < count; ++i) {
-            const int len = as<int>(lens[i]);
+        i32 max_len = 0;
+        i32 bl_count[kMaxBits + 1] = {};
+        for (i32 i = 0; i < count; ++i) {
+            const i32 len = as<i32>(lens[i]);
             if (len > kMaxBits) [[unlikely]] {
                 return ErrorCode::InvalidData;
             }
@@ -106,8 +106,8 @@ struct HuffmanTree {
         }
 
         // Reject over-subscribed code length sets (RFC 1951 §3.2.2)
-        int left = 1;
-        for (int bits = 1; bits <= max_len; ++bits) {
+        i32 left = 1;
+        for (i32 bits = 1; bits <= max_len; ++bits) {
             left <<= 1;
             left -= bl_count[bits];
             if (left < 0) [[unlikely]] {
@@ -115,20 +115,20 @@ struct HuffmanTree {
             }
         }
 
-        int next_code[kMaxBits + 1] = {};
-        int code = 0;
-        for (int bits = 1; bits <= max_len; ++bits) {
+        i32 next_code[kMaxBits + 1] = {};
+        i32 code = 0;
+        for (i32 bits = 1; bits <= max_len; ++bits) {
             code = (code + bl_count[bits - 1]) << 1;
             next_code[bits] = code;
         }
 
-        for (int i = 0; i < count; ++i) {
-            const int len = as<int>(lens[i]);
+        for (i32 i = 0; i < count; ++i) {
+            const i32 len = as<i32>(lens[i]);
             if (len == 0) continue;
-            const int c = next_code[len]++;
-            int node = 0;
-            for (int b = len - 1; b >= 0; --b) {
-                const int bit = (c >> b) & 1;
+            const i32 c = next_code[len]++;
+            i32 node = 0;
+            for (i32 b = len - 1; b >= 0; --b) {
+                const i32 bit = (c >> b) & 1;
                 const usize child_idx = as<usize>(node * 2 + bit);
                 if (b == 0) {
                     if (nodes[child_idx] != 0) [[unlikely]] {
@@ -141,22 +141,22 @@ struct HuffmanTree {
                         return ErrorCode::InvalidData;
                     }
                     if (child == 0) {
-                        const int new_node = as<int>(nodes.size() / 2);
+                        const i32 new_node = as<i32>(nodes.size() / 2);
                         nodes[child_idx] = as<i16>(new_node);
                         nodes.push_back(0);
                         nodes.push_back(0);
                         child = as<i16>(new_node);
                     }
-                    node = as<int>(child);
+                    node = as<i32>(child);
                 }
             }
         }
         return ErrorCode::Ok;
     }
 
-    [[nodiscard]] ErrorCode decode(BitReader& br, int& sym_out) const noexcept {
+    [[nodiscard]] ErrorCode decode(BitReader& br, i32& sym_out) const noexcept {
         const i16* tree_data = nodes.data();
-        int node = 0;
+        i32 node = 0;
         while (true) {
             u32 bit = 0;
             if (!br.read_bits(1, bit)) [[unlikely]] {
@@ -164,51 +164,51 @@ struct HuffmanTree {
             }
             const i16 child = tree_data[as<usize>(node * 2) + as<usize>(bit)];
             if (child < 0) {
-                sym_out = as<int>(-child) - 1;
+                sym_out = as<i32>(-child) - 1;
                 return ErrorCode::Ok;
             }
             if (child == 0) [[unlikely]] {
                 return ErrorCode::InvalidData;
             }
-            node = as<int>(child);
+            node = as<i32>(child);
         }
     }
 };
 
-constexpr int kExtraLengthBits[29] = {
+constexpr i32 kExtraLengthBits[29] = {
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 };
 
-constexpr int kLengthBase[29] = {
+constexpr i32 kLengthBase[29] = {
     3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
     31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
 };
 
-constexpr int kExtraDistBits[30] = {
+constexpr i32 kExtraDistBits[30] = {
     0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
     6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
 };
 
-constexpr int kDistBase[30] = {
+constexpr i32 kDistBase[30] = {
     1,    2,    3,    4,    5,    7,    9,    13,    17,    25,   33,   49,   65,    97,    129,
     193,  257,  385,  513,  769,  1025, 1537, 2049,  3073,  4097, 6145, 8193, 12289, 16385, 24577,
 };
 
-constexpr int kCodeLengthOrder[19] = {
+constexpr i32 kCodeLengthOrder[19] = {
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 };
 
 void build_fixed_trees(HuffmanTree& lit_tree, HuffmanTree& dist_tree) {
     u8 lit_lens[288];
-    for (int i = 0; i <= 143; ++i) lit_lens[i] = 8;
-    for (int i = 144; i <= 255; ++i) lit_lens[i] = 9;
-    for (int i = 256; i <= 279; ++i) lit_lens[i] = 7;
-    for (int i = 280; i <= 287; ++i) lit_lens[i] = 8;
+    for (i32 i = 0; i <= 143; ++i) lit_lens[i] = 8;
+    for (i32 i = 144; i <= 255; ++i) lit_lens[i] = 9;
+    for (i32 i = 256; i <= 279; ++i) lit_lens[i] = 7;
+    for (i32 i = 280; i <= 287; ++i) lit_lens[i] = 8;
     [[maybe_unused]] const ErrorCode ec1 = lit_tree.build(lit_lens, 288);
     KEEL_ASSERT(ec1 == ErrorCode::Ok);
 
     u8 dist_lens[32];
-    for (int i = 0; i < 32; ++i) dist_lens[i] = 5;
+    for (i32 i = 0; i < 32; ++i) dist_lens[i] = 5;
     [[maybe_unused]] const ErrorCode ec2 = dist_tree.build(dist_lens, 32);
     KEEL_ASSERT(ec2 == ErrorCode::Ok);
 }
@@ -278,15 +278,15 @@ void build_fixed_trees(HuffmanTree& lit_tree, HuffmanTree& dist_tree) {
                     [[unlikely]] {
                     return ErrorCode::EndOfFile;
                 }
-                const int hlit = as<int>(hlit_raw) + 257;
-                const int hdist = as<int>(hdist_raw) + 1;
-                const int hclen = as<int>(hclen_raw) + 4;
+                const i32 hlit = as<i32>(hlit_raw) + 257;
+                const i32 hdist = as<i32>(hdist_raw) + 1;
+                const i32 hclen = as<i32>(hclen_raw) + 4;
                 if (hlit > 286 || hdist > 30) [[unlikely]] {
                     return ErrorCode::InvalidData;
                 }
 
                 u8 cl_code_lens[19] = {};
-                for (int i = 0; i < hclen; ++i) {
+                for (i32 i = 0; i < hclen; ++i) {
                     u32 cl_val = 0;
                     if (!br.read_bits(3, cl_val)) [[unlikely]] {
                         return ErrorCode::EndOfFile;
@@ -299,11 +299,11 @@ void build_fixed_trees(HuffmanTree& lit_tree, HuffmanTree& dist_tree) {
                     return cl_ec;
                 }
 
-                const int total_codes = hlit + hdist;
+                const i32 total_codes = hlit + hdist;
                 u8 all_lens[320] = {};
-                int idx = 0;
+                i32 idx = 0;
                 while (idx < total_codes) {
-                    int sym = 0;
+                    i32 sym = 0;
                     const ErrorCode dec_ec = cl_tree.decode(br, sym);
                     if (dec_ec != ErrorCode::Ok) [[unlikely]] {
                         return dec_ec;
@@ -318,26 +318,26 @@ void build_fixed_trees(HuffmanTree& lit_tree, HuffmanTree& dist_tree) {
                         if (!br.read_bits(2, rep_extra)) [[unlikely]] {
                             return ErrorCode::EndOfFile;
                         }
-                        const int rep = as<int>(rep_extra) + 3;
+                        const i32 rep = as<i32>(rep_extra) + 3;
                         if (idx + rep > total_codes) [[unlikely]] {
                             return ErrorCode::InvalidData;
                         }
                         const u8 prev = all_lens[idx - 1];
-                        for (int r = 0; r < rep; ++r) {
+                        for (i32 r = 0; r < rep; ++r) {
                             all_lens[idx++] = prev;
                         }
                     } else if (sym == 17 || sym == 18) {
                         u32 rep_extra = 0;
-                        const int extra_bits = (sym == 17) ? 3 : 7;
-                        const int base_rep = (sym == 17) ? 3 : 11;
+                        const i32 extra_bits = (sym == 17) ? 3 : 7;
+                        const i32 base_rep = (sym == 17) ? 3 : 11;
                         if (!br.read_bits(extra_bits, rep_extra)) [[unlikely]] {
                             return ErrorCode::EndOfFile;
                         }
-                        const int rep = as<int>(rep_extra) + base_rep;
+                        const i32 rep = as<i32>(rep_extra) + base_rep;
                         if (idx + rep > total_codes) [[unlikely]] {
                             return ErrorCode::InvalidData;
                         }
-                        for (int r = 0; r < rep; ++r) {
+                        for (i32 r = 0; r < rep; ++r) {
                             all_lens[idx++] = 0;
                         }
                     } else {
@@ -361,7 +361,7 @@ void build_fixed_trees(HuffmanTree& lit_tree, HuffmanTree& dist_tree) {
             }
 
             while (true) {
-                int sym = 0;
+                i32 sym = 0;
                 const ErrorCode sym_ec = lit_tree.decode(br, sym);
                 if (sym_ec != ErrorCode::Ok) [[unlikely]] {
                     return sym_ec;
@@ -375,9 +375,9 @@ void build_fixed_trees(HuffmanTree& lit_tree, HuffmanTree& dist_tree) {
                 } else if (sym == 256) {
                     break;
                 } else if (sym <= 285) {
-                    const int len_idx = sym - 257;
+                    const i32 len_idx = sym - 257;
                     usize length = as<usize>(kLengthBase[len_idx]);
-                    const int extra_bits = kExtraLengthBits[len_idx];
+                    const i32 extra_bits = kExtraLengthBits[len_idx];
                     if (extra_bits > 0) {
                         u32 extra_val = 0;
                         if (!br.read_bits(extra_bits, extra_val)) [[unlikely]] {
@@ -386,7 +386,7 @@ void build_fixed_trees(HuffmanTree& lit_tree, HuffmanTree& dist_tree) {
                         length += as<usize>(extra_val);
                     }
 
-                    int dist_sym = 0;
+                    i32 dist_sym = 0;
                     const ErrorCode dist_ec = dist_tree.decode(br, dist_sym);
                     if (dist_ec != ErrorCode::Ok) [[unlikely]] {
                         return dist_ec;
@@ -396,7 +396,7 @@ void build_fixed_trees(HuffmanTree& lit_tree, HuffmanTree& dist_tree) {
                     }
 
                     usize dist = as<usize>(kDistBase[dist_sym]);
-                    const int extra_dist_bits = kExtraDistBits[dist_sym];
+                    const i32 extra_dist_bits = kExtraDistBits[dist_sym];
                     if (extra_dist_bits > 0) {
                         u32 extra_val = 0;
                         if (!br.read_bits(extra_dist_bits, extra_val)) [[unlikely]] {
@@ -444,7 +444,7 @@ class BitWriter {
 public:
     explicit BitWriter(Array<u8>& dst) noexcept : m_bytes(dst) {}
 
-    void write_bits(u32 val, int n) {
+    void write_bits(u32 val, i32 n) {
         KEEL_ASSERT(n >= 0 && n <= 24);
         m_bit_buf |= (val << m_bit_count);
         m_bit_count += n;
@@ -473,7 +473,7 @@ public:
 private:
     Array<u8>& m_bytes;
     u32 m_bit_buf = 0;
-    int m_bit_count = 0;
+    i32 m_bit_count = 0;
 };
 
 struct FixedCode {
@@ -481,9 +481,9 @@ struct FixedCode {
     u8 len = 0;
 };
 
-consteval u16 bit_reverse(u16 val, int len) noexcept {
+consteval u16 bit_reverse(u16 val, i32 len) noexcept {
     u16 res = 0;
-    for (int i = 0; i < len; ++i) {
+    for (i32 i = 0; i < len; ++i) {
         res = as<u16>((res << 1) | ((val >> i) & 1u));
     }
     return res;
@@ -496,7 +496,7 @@ struct FixedLitTable {
 
 consteval FixedLitTable make_fixed_lit_table() noexcept {
     FixedLitTable tbl{};
-    for (int sym = 0; sym < 288; ++sym) {
+    for (i32 sym = 0; sym < 288; ++sym) {
         if (sym <= 143) {
             tbl.codes[sym] = {bit_reverse(as<u16>(0x30 + sym), 8), 8};
         } else if (sym <= 255) {
@@ -507,7 +507,7 @@ consteval FixedLitTable make_fixed_lit_table() noexcept {
             tbl.codes[sym] = {bit_reverse(as<u16>(0xC0 + (sym - 280)), 8), 8};
         }
     }
-    for (int d = 0; d < 30; ++d) {
+    for (i32 d = 0; d < 30; ++d) {
         tbl.dist_codes[d] = as<u8>(bit_reverse(as<u16>(d), 5));
     }
     return tbl;
@@ -515,7 +515,7 @@ consteval FixedLitTable make_fixed_lit_table() noexcept {
 
 constexpr FixedLitTable kFixedLitTable = make_fixed_lit_table();
 
-void deflate_into(Array<u8>& out, ArrayRef<u8> src, int level) {
+void deflate_into(Array<u8>& out, ArrayRef<u8> src, i32 level) {
     const u8* data = src.data();
     const usize len = src.size();
     BitWriter bw(out);
@@ -561,7 +561,7 @@ void deflate_into(Array<u8>& out, ArrayRef<u8> src, int level) {
                (kHashSize - 1);
     };
 
-    const int max_chain = (level <= 3) ? 4 : ((level <= 6) ? 16 : 64);
+    const i32 max_chain = (level <= 3) ? 4 : ((level <= 6) ? 16 : 64);
 
     usize pos = 0;
     while (pos < len) {
@@ -574,7 +574,7 @@ void deflate_into(Array<u8>& out, ArrayRef<u8> src, int level) {
             prev[pos & (kWindowSize - 1)] = match_pos;
             head[h] = pos;
 
-            int chain_limit = max_chain;
+            i32 chain_limit = max_chain;
             const usize max_len_possible = keel::min<usize>(len - pos, kMaxMatch);
             while (match_pos != kInvalidIndex && (pos - match_pos) <= kWindowSize && chain_limit-- > 0) {
                 const usize cur_dist = pos - match_pos;
@@ -594,8 +594,8 @@ void deflate_into(Array<u8>& out, ArrayRef<u8> src, int level) {
         }
 
         if (best_len >= kMinMatch) {
-            int len_idx = 0;
-            for (int i = 0; i < 29; ++i) {
+            i32 len_idx = 0;
+            for (i32 i = 0; i < 29; ++i) {
                 if (as<usize>(kLengthBase[i]) <= best_len) {
                     len_idx = i;
                 } else {
@@ -604,13 +604,13 @@ void deflate_into(Array<u8>& out, ArrayRef<u8> src, int level) {
             }
             const FixedCode lit_code = kFixedLitTable.codes[257 + len_idx];
             bw.write_bits(lit_code.bits, lit_code.len);
-            const int extra_len_bits = kExtraLengthBits[len_idx];
+            const i32 extra_len_bits = kExtraLengthBits[len_idx];
             if (extra_len_bits > 0) {
                 bw.write_bits(as<u32>(best_len - as<usize>(kLengthBase[len_idx])), extra_len_bits);
             }
 
-            int dist_idx = 0;
-            for (int i = 0; i < 30; ++i) {
+            i32 dist_idx = 0;
+            for (i32 i = 0; i < 30; ++i) {
                 if (as<usize>(kDistBase[i]) <= best_dist) {
                     dist_idx = i;
                 } else {
@@ -618,7 +618,7 @@ void deflate_into(Array<u8>& out, ArrayRef<u8> src, int level) {
                 }
             }
             bw.write_bits(kFixedLitTable.dist_codes[dist_idx], 5);
-            const int extra_dist_bits = kExtraDistBits[dist_idx];
+            const i32 extra_dist_bits = kExtraDistBits[dist_idx];
             if (extra_dist_bits > 0) {
                 bw.write_bits(as<u32>(best_dist - as<usize>(kDistBase[dist_idx])), extra_dist_bits);
             }
@@ -715,7 +715,7 @@ Result<Array<u8>> inflate_raw(ArrayRef<u8> src, const InflateOptions& opts) {
     return inflate_raw_impl(src, opts, nullptr);
 }
 
-Array<u8> deflate_raw(ArrayRef<u8> src, int level, Allocator* alloc) {
+Array<u8> deflate_raw(ArrayRef<u8> src, i32 level, Allocator* alloc) {
     Array<u8> out(alloc);
     out.reserve((src.size() / 2) + 32);
     deflate_into(out, src, level);
@@ -756,7 +756,7 @@ Result<Array<u8>> zlib_decompress(ArrayRef<u8> src, const InflateOptions& opts) 
     return uncompressed;
 }
 
-Array<u8> zlib_compress(ArrayRef<u8> src, int level, Allocator* alloc) {
+Array<u8> zlib_compress(ArrayRef<u8> src, i32 level, Allocator* alloc) {
     Array<u8> out(alloc);
     out.reserve((src.size() / 2) + 64);
 
