@@ -94,7 +94,7 @@ void test_multi_block_and_repetitive() {
     u32 rng = 0x12345678u;
     for (usize i = 0; i < mixed.size(); ++i) {
         rng = rng * 1664525u + 1013904223u;
-        mixed[i] = static_cast<u8>((i % 251u) ^ ((rng >> 24) & 0x1Fu));
+        mixed[i] = keel::as<u8>((i % 251u) ^ ((rng >> 24) & 0x1Fu));
     }
     for (int lvl : {0, 1, 6, 9}) {
         Array<u8> zc = zlib_compress(mixed, lvl);
@@ -121,7 +121,7 @@ void test_dynamic_huffman_vector() {
     u32 rng = 1u;
     for (usize i = 0; i < 256; ++i) {
         rng = (rng * 1103515245u + 12345u) & 0x7FFFFFFFu;
-        expected[i] = static_cast<u8>(65u + ((rng >> 16) & 3u));
+        expected[i] = keel::as<u8>(65u + ((rng >> 16) & 3u));
     }
 
     auto dec = zlib_decompress(dyn_vec);
@@ -149,7 +149,7 @@ void test_safety_and_errors() {
     fdict_hdr[0] = 0x78u;
     fdict_hdr[1] = 0x20u;
     const u32 rem = ((0x78u << 8) + 0x20u) % 31u;
-    if (rem != 0) fdict_hdr[1] = static_cast<u8>(0x20u + (31u - rem));
+    if (rem != 0) fdict_hdr[1] = keel::as<u8>(0x20u + (31u - rem));
     TEST_CHECK(zlib_decompress(fdict_hdr).error().code == ErrorCode::NotSupported);
 
     // 5. Corrupted Adler-32 trailer
