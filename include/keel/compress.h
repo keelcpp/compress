@@ -3,7 +3,7 @@
 #include "keel/array.h"
 #include "keel/result.h"
 
-namespace keel {
+namespace keel::compress {
 
 inline constexpr usize kDefaultMaxDecompressBytes = 512ULL * 1024 * 1024;
 
@@ -43,4 +43,4 @@ struct InflateOptions {
 // RFC 1950 ZLIB stream compression (2-byte header + Deflate payload + 4-byte big-endian Adler-32).
 [[nodiscard]] Array<u8> zlib_compress(ArrayRef<u8> src, int level = 6, Allocator* alloc = nullptr);
 
-} // namespace keel
+} // namespace keel::compress

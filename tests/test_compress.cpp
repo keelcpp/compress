@@ -6,6 +6,7 @@
 #include <cstring>
 
 using namespace keel;
+using namespace keel::compress;
 
 namespace {
 

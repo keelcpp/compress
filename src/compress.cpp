@@ -2,7 +2,7 @@
 
 #include "keel/arena.h"
 
-namespace keel {
+namespace keel::compress {
 
 namespace {
 
@@ -782,4 +782,4 @@ Array<u8> zlib_compress(ArrayRef<u8> src, int level, Allocator* alloc) {
     return out;
 }
 
-} // namespace keel
+} // namespace keel::compress
