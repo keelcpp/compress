@@ -1,22 +1,21 @@
 #include "keel/compress.h"
 
 #include "keel/arena.h"
-
-#include <cstdio>
-#include <cstring>
+#include "keel/format.h"
+#include "keel/string.h"
 
 using namespace keel;
 using namespace keel::compress;
 
 namespace {
 
-int g_tests_passed = 0;
-int g_tests_failed = 0;
+i32 g_tests_passed = 0;
+i32 g_tests_failed = 0;
 
 #define TEST_CHECK(cond)                                                                                               \
     do {                                                                                                               \
         if (!(cond)) {                                                                                                 \
-            std::fprintf(stderr, "FAIL: %s (%s:%d)\n", #cond, __FILE__, __LINE__);                                     \
+            keel::eprintln("FAIL: {} ({}:{})", #cond, __FILE__, __LINE__);                                             \
             ++g_tests_failed;                                                                                          \
         } else {                                                                                                       \
             ++g_tests_passed;                                                                                          \
@@ -52,7 +51,7 @@ void test_checksums() {
 
 void test_empty_and_small_roundtrip() {
     ArrayRef<u8> empty{};
-    for (int lvl : {0, 1, 6, 9}) {
+    for (i32 lvl : {0, 1, 6, 9}) {
         Array<u8> raw_comp = deflate_raw(empty, lvl);
         auto raw_dec = inflate_raw(raw_comp);
         TEST_CHECK(raw_dec.is_ok());
@@ -65,8 +64,8 @@ void test_empty_and_small_roundtrip() {
     }
 
     const char* msg = "Hello from keel::compress! Testing LZ77 + Fixed Huffman & RFC 1950 ZLIB.";
-    ArrayRef<u8> msg_bytes(reinterpret_cast<const u8*>(msg), std::strlen(msg));
-    for (int lvl : {0, 1, 6, 9}) {
+    ArrayRef<u8> msg_bytes(reinterpret_cast<const u8*>(msg), StringRef(msg).size());
+    for (i32 lvl : {0, 1, 6, 9}) {
         Array<u8> raw_comp = deflate_raw(msg_bytes, lvl);
         auto raw_dec = inflate_raw(raw_comp);
         TEST_CHECK(raw_dec.is_ok() && *raw_dec == msg_bytes);
@@ -96,7 +95,7 @@ void test_multi_block_and_repetitive() {
         rng = rng * 1664525u + 1013904223u;
         mixed[i] = keel::as<u8>((i % 251u) ^ ((rng >> 24) & 0x1Fu));
     }
-    for (int lvl : {0, 1, 6, 9}) {
+    for (i32 lvl : {0, 1, 6, 9}) {
         Array<u8> zc = zlib_compress(mixed, lvl);
         auto zd = zlib_decompress(zc, InflateOptions{.expected_size_hint = mixed.size()});
         TEST_CHECK(zd.is_ok() && *zd == mixed);
@@ -181,9 +180,9 @@ int main() {
     test_safety_and_errors();
 
     if (g_tests_failed != 0) {
-        std::fprintf(stderr, "%d test check(s) FAILED (%d passed)\n", g_tests_failed, g_tests_passed);
+        keel::eprintln("{} test check(s) FAILED ({} passed)", g_tests_failed, g_tests_passed);
         return 1;
     }
-    std::printf("All %d keel::compress test checks passed.\n", g_tests_passed);
+    keel::println("All {} keel::compress test checks passed.", g_tests_passed);
     return 0;
 }

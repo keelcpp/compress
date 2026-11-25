@@ -103,6 +103,14 @@ if(KEEL_COMPRESS_BUILD_TESTS)
     else()
         target_compile_options(test_compress PRIVATE -Wall -Wextra -Wpedantic)
     endif()
+    if(COMMAND keel_enforce_guidelines)
+        keel_enforce_guidelines(test_compress
+            SCOPE ALL
+            BAN_RAW_INTS ALL
+            BAN_RAW_FLOATS ALL
+            WARNINGS OFF
+        )
+    endif()
     add_test(NAME test_compress COMMAND test_compress)
 
     get_target_property(KEEL_CORE_INC_DIRS keel::keel INTERFACE_INCLUDE_DIRECTORIES)
