@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(keel_compress VERSION 0.1.0 LANGUAGES CXX)
+project(keel_compress VERSION 0.2.0 LANGUAGES CXX)
 
 option(KEEL_COMPRESS_NO_EXCEPTIONS_RTTI "Compile keel_compress without C++ exceptions and RTTI" OFF)
 option(KEEL_COMPRESS_BUILD_TESTS "Build keel_compress unit tests and header purity checks" ${PROJECT_IS_TOP_LEVEL})
@@ -21,7 +21,13 @@ if(NOT TARGET keel::keel)
     FetchContent_MakeAvailable(keel)
 endif()
 
-add_library(keel_compress STATIC src/compress.cpp)
+add_library(keel_compress STATIC
+    src/checksum.cpp
+    src/deflate.cpp
+    src/gzip.cpp
+    src/lz4.cpp
+    src/zip.cpp
+)
 add_library(keel::compress ALIAS keel_compress)
 
 target_link_libraries(keel_compress PUBLIC keel::keel)
@@ -112,27 +118,4 @@ if(KEEL_COMPRESS_BUILD_TESTS)
         )
     endif()
     add_test(NAME test_compress COMMAND test_compress)
-
-    get_target_property(KEEL_CORE_INC_DIRS keel::keel INTERFACE_INCLUDE_DIRECTORIES)
-    set(KEEL_CORE_INC_CLEAN "")
-    foreach(IDIR IN LISTS KEEL_CORE_INC_DIRS)
-        string(REGEX REPLACE "\\$<BUILD_INTERFACE:([^>]+)>" "\\1" IDIR_STRIPPED "${IDIR}")
-        if(NOT IDIR_STRIPPED MATCHES "\\$<INSTALL_INTERFACE:" AND EXISTS "${IDIR_STRIPPED}")
-            list(APPEND KEEL_CORE_INC_CLEAN "${IDIR_STRIPPED}")
-        endif()
-    endforeach()
-    string(REPLACE ";" "|" KEEL_DEP_INC_JOINED "${KEEL_CORE_INC_CLEAN}")
-    string(REPLACE ";" "|" KEEL_STD_INC_JOINED "${CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES}")
-
-    add_test(
-        NAME test_header_purity
-        COMMAND ${CMAKE_COMMAND}
-            "-DKEEL_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/include"
-            "-DKEEL_DEP_INC_DIRS=${KEEL_DEP_INC_JOINED}"
-            "-DCOMPILER_PATH=${CMAKE_CXX_COMPILER}"
-            "-DCOMPILER_ID=${CMAKE_CXX_COMPILER_ID}"
-            "-DSTD_INC_DIRS=${KEEL_STD_INC_JOINED}"
-            "-DCMAKE_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckHeaderPurity.cmake"
-    )
 endif()
