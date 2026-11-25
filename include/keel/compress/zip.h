@@ -20,9 +20,9 @@ struct ZipEntry {
     u16 method = 0u;
     u16 flags = 0u;
     u32 crc32 = 0u;
-    u32 compressed_size = 0u;
-    u32 uncompressed_size = 0u;
-    u32 local_header_offset = 0u;
+    u64 compressed_size = 0u;
+    u64 uncompressed_size = 0u;
+    u64 local_header_offset = 0u;
 
     [[nodiscard]] bool is_directory() const noexcept {
         return !name.empty() && name[name.size() - 1u] == '/';

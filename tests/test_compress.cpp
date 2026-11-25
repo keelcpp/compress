@@ -197,6 +197,52 @@ void test_deflate_zlib_and_streaming() {
             ? inflate_raw(streamed)
             : ((fmt == StreamFormat::Zlib) ? zlib_decompress(streamed) : gzip_decompress(streamed));
         TEST_CHECK(dec.is_ok() && *dec == big);
+
+        // Streaming InflateStream with small irregular chunks (13 bytes at a time)
+        InflateStream is(fmt);
+        Array<u8> is_out;
+        ErrorCode ec = ErrorCode::Ok;
+        for (usize off = 0u; off < streamed.size() && ec == ErrorCode::Ok; off += 13u) {
+            const usize n = keel::min<usize>(streamed.size() - off, 13u);
+            ec = is.push(streamed.slice(off, n), is_out);
+        }
+        TEST_CHECK(ec == ErrorCode::Ok && is.finish() == ErrorCode::Ok && is_out == big);
+    }
+
+    // Streaming InflateStream byte-by-byte on multi-member GZIP with FEXTRA/FNAME/FCOMMENT/FHCRC + error checks
+    {
+        const u8 ex[] = {1u, 2u, 3u, 4u};
+        GzipOptions go{};
+        go.filename = "stream.dat";
+        go.comment = "comment";
+        go.extra = ArrayRef<u8>(ex, sizeof(ex));
+        go.write_header_crc = true;
+        Array<u8> p1(1000u, as<u8>('X'));
+        Array<u8> p2(500u, as<u8>('Y'));
+        Array<u8> gz = gzip_compress(p1, go);
+        Array<u8> gz_part2 = gzip_compress(p2, 9);
+        gz.append(gz_part2.as_ref());
+
+        InflateStream is(StreamFormat::Gzip);
+        Array<u8> out;
+        ErrorCode ec = ErrorCode::Ok;
+        for (usize i = 0u; i < gz.size() && ec == ErrorCode::Ok; ++i) {
+            ec = is.push(gz.slice(i, 1u), out);
+        }
+        Array<u8> expected_cat = p1.clone();
+        expected_cat.append(p2.as_ref());
+        TEST_CHECK(ec == ErrorCode::Ok && is.finish() == ErrorCode::Ok && out == expected_cat);
+
+        // Truncated stream must fail on finish()
+        InflateStream trunc(StreamFormat::Gzip);
+        Array<u8> tout;
+        TEST_CHECK(trunc.push(gz.slice(0u, gz.size() - 3u), tout) == ErrorCode::Ok);
+        TEST_CHECK(trunc.finish() == ErrorCode::EndOfFile);
+
+        // Bomb cap enforced during streaming push()
+        InflateStream capped(StreamFormat::Gzip, InflateOptions{.max_output_bytes = 256u});
+        Array<u8> cout;
+        TEST_CHECK(capped.push(gz, cout) == ErrorCode::OutOfRange);
     }
 
     // Official BTYPE=2 vector produced by standard zlib
@@ -518,6 +564,37 @@ int main(int argc, char** argv) {
                        : ((cmd == "--gzip-dec") ? gzip_decompress(*in) : lz4_frame_decompress(*in)));
             if (out.is_err()) return 4;
             return fs_write_file(StringRef(argv[3]), out->as_ref()).is_ok() ? 0 : 3;
+        }
+        if (cmd == "--lz4-block-enc" && argc == 4) {
+            auto in = fs_read_file(StringRef(argv[2]));
+            if (in.is_err()) return 2;
+            Array<u8> out = lz4_compress_block(*in);
+            return fs_write_file(StringRef(argv[3]), out.as_ref()).is_ok() ? 0 : 3;
+        }
+        if (cmd == "--lz4-block-dec" && argc == 4) {
+            auto in = fs_read_file(StringRef(argv[2]));
+            if (in.is_err()) return 2;
+            auto out = lz4_decompress_block(*in);
+            if (out.is_err()) return 4;
+            return fs_write_file(StringRef(argv[3]), out->as_ref()).is_ok() ? 0 : 3;
+        }
+        if (cmd == "--inflate-stream" && argc == 6) {
+            const StringRef fmt_s(argv[2]);
+            auto step = parse_u64(StringRef(argv[3]));
+            auto in = fs_read_file(StringRef(argv[4]));
+            if (step.is_err() || step.value() == 0u || in.is_err()) return 2;
+            const StreamFormat fmt = (fmt_s == "raw")
+                ? StreamFormat::Raw
+                : ((fmt_s == "zlib") ? StreamFormat::Zlib : StreamFormat::Gzip);
+            InflateStream is(fmt);
+            Array<u8> out;
+            const usize chunk = as<usize>(step.value());
+            for (usize off = 0u; off < in->size(); off += chunk) {
+                const usize n = keel::min<usize>(in->size() - off, chunk);
+                if (is.push(in->slice(off, n), out) != ErrorCode::Ok) return 4;
+            }
+            if (is.finish() != ErrorCode::Ok) return 5;
+            return fs_write_file(StringRef(argv[5]), out.as_ref()).is_ok() ? 0 : 3;
         }
         if (cmd == "--lz4-frame-enc" && argc == 7) {
             auto bid = parse_u64(StringRef(argv[2]));

@@ -1374,4 +1374,626 @@ Array<u8> DeflateStream::finish() {
     return take_output();
 }
 
+// ---------------------------------------------------------------------------
+// Streaming InflateStream (bounded 32 KiB sliding window)
+// ---------------------------------------------------------------------------
+ErrorCode InflateStream::StreamHuff::build(const u8* lens, i32 count, bool allow_empty) {
+    for (usize i = 0u; i < kPrimarySize; ++i) primary[i] = kInvalid;
+    sub.clear();
+    empty = false;
+
+    i32 bl_count[16] = {};
+    i32 max_len = 0;
+    for (i32 i = 0; i < count; ++i) {
+        const i32 len = as<i32>(lens[i]);
+        if (len > 15) return ErrorCode::InvalidData;
+        if (len > 0) {
+            ++bl_count[len];
+            if (len > max_len) max_len = len;
+        }
+    }
+    if (max_len == 0) {
+        empty = true;
+        return allow_empty ? ErrorCode::Ok : ErrorCode::InvalidData;
+    }
+
+    i32 left = 1;
+    for (i32 bits = 1; bits <= max_len; ++bits) {
+        left <<= 1;
+        left -= bl_count[bits];
+        if (left < 0) return ErrorCode::InvalidData;
+    }
+
+    u16 next_code[16] = {};
+    u16 code = 0u;
+    for (i32 bits = 1; bits <= max_len; ++bits) {
+        code = as<u16>((code + as<u16>(bl_count[bits - 1])) << 1u);
+        next_code[bits] = code;
+    }
+
+    u16 sym_codes[320] = {};
+    u8 sub_max[kPrimarySize] = {};
+    constexpr u64 kMask = kPrimarySize - 1u;
+    for (i32 i = 0; i < count; ++i) {
+        const i32 len = as<i32>(lens[i]);
+        if (len == 0) continue;
+        const u16 rev = bit_reverse(next_code[len]++, len);
+        sym_codes[i] = rev;
+        if (len > kPrimaryBits) {
+            const usize p = as<usize>(rev & kMask);
+            const u8 ex = as<u8>(len - kPrimaryBits);
+            if (ex > sub_max[p]) sub_max[p] = ex;
+        }
+    }
+
+    for (usize p = 0u; p < kPrimarySize; ++p) {
+        if (sub_max[p] > 0u) {
+            const usize off = sub.size();
+            const usize sz = usize{1u} << as<u32>(sub_max[p]);
+            for (usize k = 0u; k < sz; ++k) sub.push_back(kInvalid);
+            primary[p] = (as<u32>(off) << 16u) | (as<u32>(sub_max[p]) << 8u) | 1u;
+        }
+    }
+
+    for (i32 i = 0; i < count; ++i) {
+        const i32 len = as<i32>(lens[i]);
+        if (len == 0) continue;
+        const u16 rev = sym_codes[i];
+        if (len <= kPrimaryBits) {
+            const u32 entry = (as<u32>(i) << 16u) | (as<u32>(len) << 8u);
+            const usize step = usize{1u} << as<u32>(len);
+            for (usize idx = as<usize>(rev); idx < kPrimarySize; idx += step) {
+                if (primary[idx] != kInvalid) return ErrorCode::InvalidData;
+                primary[idx] = entry;
+            }
+        } else {
+            const usize p = as<usize>(rev & kMask);
+            const u32 pe = primary[p];
+            const usize off = as<usize>(pe >> 16u);
+            const i32 sb = as<i32>((pe >> 8u) & 0xFFu);
+            const usize ssz = usize{1u} << as<u32>(sb);
+            const i32 ex = len - kPrimaryBits;
+            const u32 entry = (as<u32>(i) << 16u) | (as<u32>(ex) << 8u);
+            const usize step = usize{1u} << as<u32>(ex);
+            for (usize idx = as<usize>(rev >> as<u32>(kPrimaryBits)); idx < ssz; idx += step) {
+                if (sub[off + idx] != kInvalid) return ErrorCode::InvalidData;
+                sub[off + idx] = entry;
+            }
+        }
+    }
+    return ErrorCode::Ok;
+}
+
+InflateStream::InflateStream(StreamFormat fmt, const InflateOptions& opts)
+    : m_format(fmt),
+      m_max_out(opts.max_output_bytes),
+      m_alloc(opts.allocator ? opts.allocator : default_allocator()),
+      m_window(32768u, u8{0u}, m_alloc),
+      m_lit_tree(m_alloc),
+      m_dist_tree(m_alloc),
+      m_cl_tree(m_alloc) {
+    if (fmt == StreamFormat::Zlib) {
+        m_state = State::ZlibHdr;
+        m_tmp_need = 2u;
+    } else if (fmt == StreamFormat::Gzip) {
+        m_state = State::GzipHdrFixed;
+        m_tmp_need = 10u;
+    } else {
+        m_state = State::BlockHdr;
+    }
+}
+
+void InflateStream::reset_for_next_gzip_member() noexcept {
+    m_bit_buf = 0u;
+    m_bit_count = 0;
+    m_win_pos = 0u;
+    m_win_fill = 0u;
+    m_bfinal = false;
+    m_finished = false;
+    m_crc = 0u;
+    m_member_out = 0u;
+    m_tmp_pos = 0u;
+    m_tmp_need = 10u;
+    m_gz_flg = 0u;
+    m_gz_hcrc = 0u;
+    m_state = State::GzipHdrFixed;
+}
+
+ErrorCode InflateStream::emit_byte(u8 b, Array<u8>& out) {
+    if (m_max_out > 0u && m_total_out >= m_max_out) [[unlikely]] {
+        m_error = ErrorCode::OutOfRange;
+        m_state = State::Failed;
+        return m_error;
+    }
+    out.push_back(b);
+    m_window[m_win_pos] = b;
+    m_win_pos = (m_win_pos + 1u) & 32767u;
+    if (m_win_fill < 32768u) ++m_win_fill;
+    ++m_member_out;
+    ++m_total_out;
+    if (m_format == StreamFormat::Zlib) {
+        m_adler = adler32_update(m_adler, ArrayRef<u8>(&b, 1u));
+    } else if (m_format == StreamFormat::Gzip) {
+        m_crc = crc32_update(m_crc, ArrayRef<u8>(&b, 1u));
+    }
+    return ErrorCode::Ok;
+}
+
+ErrorCode InflateStream::emit_match(usize length, usize dist, Array<u8>& out) {
+    if (dist == 0u || dist > m_win_fill) [[unlikely]] {
+        m_error = ErrorCode::InvalidData;
+        m_state = State::Failed;
+        return m_error;
+    }
+    if (m_max_out > 0u && (length > m_max_out || m_total_out > m_max_out - length)) [[unlikely]] {
+        m_error = ErrorCode::OutOfRange;
+        m_state = State::Failed;
+        return m_error;
+    }
+    const usize old_sz = out.size();
+    out.resize(old_sz + length);
+    u8* dst = out.data() + old_sz;
+    for (usize k = 0u; k < length; ++k) {
+        const u8 b = m_window[(m_win_pos - dist) & 32767u];
+        dst[k] = b;
+        m_window[m_win_pos] = b;
+        m_win_pos = (m_win_pos + 1u) & 32767u;
+        if (m_win_fill < 32768u) ++m_win_fill;
+    }
+    m_member_out += length;
+    m_total_out += length;
+    if (m_format == StreamFormat::Zlib) {
+        m_adler = adler32_update(m_adler, ArrayRef<u8>(dst, length));
+    } else if (m_format == StreamFormat::Gzip) {
+        m_crc = crc32_update(m_crc, ArrayRef<u8>(dst, length));
+    }
+    return ErrorCode::Ok;
+}
+
+ErrorCode InflateStream::push(ArrayRef<u8> chunk, Array<u8>& out) {
+    if (m_error != ErrorCode::Ok) return m_error;
+
+    const u8* data = chunk.data();
+    const usize len = chunk.size();
+    usize pos = 0u;
+
+    auto fail = [&](ErrorCode ec) noexcept -> ErrorCode {
+        m_error = ec;
+        m_state = State::Failed;
+        return ec;
+    };
+
+    auto refill = [&]() noexcept {
+        while (m_bit_count <= 56 && pos < len) {
+            m_bit_buf |= as<u64>(data[pos++]) << as<u32>(m_bit_count);
+            m_bit_count += 8;
+        }
+    };
+
+    auto take_bits = [&](i32 n, u32& val) noexcept -> bool {
+        if (m_bit_count < n) refill();
+        if (m_bit_count < n) return false;
+        val = (n == 0) ? 0u : as<u32>(m_bit_buf & ((u64{1u} << as<u32>(n)) - 1u));
+        m_bit_buf >>= as<u32>(n);
+        m_bit_count -= n;
+        return true;
+    };
+
+    auto align_byte_pull = [&](u8& byte_out) noexcept -> bool {
+        const i32 disc = m_bit_count & 7;
+        if (disc > 0) {
+            m_bit_buf >>= as<u32>(disc);
+            m_bit_count -= disc;
+        }
+        if (m_bit_count >= 8) {
+            byte_out = as<u8>(m_bit_buf & 0xFFu);
+            m_bit_buf >>= 8u;
+            m_bit_count -= 8;
+            return true;
+        }
+        if (pos < len) {
+            byte_out = data[pos++];
+            return true;
+        }
+        return false;
+    };
+
+    // Returns: 1 = decoded sym, 0 = need more input, -1 = invalid data
+    auto decode_huff = [&](const StreamHuff& h, i32& sym_out) noexcept -> i32 {
+        if (h.empty) return -1;
+        if (m_bit_count < 15) refill();
+        if (m_bit_count == 0) return 0;
+
+        constexpr u64 kMask = StreamHuff::kPrimarySize - 1u;
+        const u32 entry = h.primary[as<usize>(m_bit_buf & kMask)];
+        const u32 kind = entry & 0xFFu;
+        if (kind == 0u) [[likely]] {
+            const i32 clen = as<i32>((entry >> 8u) & 0xFFu);
+            if (clen > m_bit_count) return 0;
+            m_bit_buf >>= as<u32>(clen);
+            m_bit_count -= clen;
+            sym_out = as<i32>(entry >> 16u);
+            return 1;
+        }
+        if (kind == 1u) {
+            if (m_bit_count <= StreamHuff::kPrimaryBits) return 0;
+            const usize off = as<usize>(entry >> 16u);
+            const i32 sb = as<i32>((entry >> 8u) & 0xFFu);
+            const u64 smask = (u64{1u} << as<u32>(sb)) - 1u;
+            const u64 sval = (m_bit_buf >> as<u32>(StreamHuff::kPrimaryBits)) & smask;
+            const u32 se = h.sub[off + as<usize>(sval)];
+            if ((se & 0xFFu) != 0u) {
+                const i32 rem = m_bit_count - StreamHuff::kPrimaryBits;
+                if (rem < sb) {
+                    const u64 rmask = (u64{1u} << as<u32>(rem)) - 1u;
+                    const usize ssz = usize{1u} << as<u32>(sb);
+                    const usize step = usize{1u} << as<u32>(rem);
+                    for (usize idx = as<usize>(sval & rmask); idx < ssz; idx += step) {
+                        if ((h.sub[off + idx] & 0xFFu) == 0u) return 0;
+                    }
+                }
+                return -1;
+            }
+            const i32 total = StreamHuff::kPrimaryBits + as<i32>((se >> 8u) & 0xFFu);
+            if (total > m_bit_count) return 0;
+            m_bit_buf >>= as<u32>(total);
+            m_bit_count -= total;
+            sym_out = as<i32>(se >> 16u);
+            return 1;
+        }
+        if (m_bit_count < StreamHuff::kPrimaryBits) {
+            const u64 mask = (u64{1u} << as<u32>(m_bit_count)) - 1u;
+            const usize step = usize{1u} << as<u32>(m_bit_count);
+            for (usize idx = as<usize>(m_bit_buf & mask); idx < StreamHuff::kPrimarySize; idx += step) {
+                if (h.primary[idx] != StreamHuff::kInvalid) return 0;
+            }
+        }
+        return -1;
+    };
+
+    while (true) {
+        switch (m_state) {
+        case State::ZlibHdr: {
+            u8 b = 0u;
+            while (m_tmp_pos < 2u && align_byte_pull(b)) m_tmp[m_tmp_pos++] = b;
+            if (m_tmp_pos < 2u) return ErrorCode::Ok;
+            const u8 cmf = m_tmp[0];
+            const u8 flg = m_tmp[1];
+            if (((as<u32>(cmf) << 8u) + as<u32>(flg)) % 31u != 0u) return fail(ErrorCode::InvalidData);
+            if ((cmf & 0x0Fu) != 8u || (cmf >> 4u) > 7u) return fail(ErrorCode::NotSupported);
+            if ((flg & 0x20u) != 0u) return fail(ErrorCode::NotSupported);
+            m_state = State::BlockHdr;
+            break;
+        }
+
+        case State::GzipHdrFixed: {
+            u8 b = 0u;
+            while (m_tmp_pos < 10u && align_byte_pull(b)) {
+                m_tmp[m_tmp_pos++] = b;
+                m_gz_hcrc = crc32_update(m_gz_hcrc, ArrayRef<u8>(&b, 1u));
+            }
+            if (m_tmp_pos < 10u) return ErrorCode::Ok;
+            if (m_tmp[0] != 0x1Fu || m_tmp[1] != 0x8Bu) return fail(ErrorCode::InvalidData);
+            if (m_tmp[2] != 8u) return fail(ErrorCode::NotSupported);
+            m_gz_flg = m_tmp[3];
+            if ((m_gz_flg & 0xE0u) != 0u) return fail(ErrorCode::InvalidData);
+            m_tmp_pos = 0u;
+            if ((m_gz_flg & 0x04u) != 0u) m_state = State::GzipExtraLen;
+            else if ((m_gz_flg & 0x08u) != 0u) m_state = State::GzipNameSkip;
+            else if ((m_gz_flg & 0x10u) != 0u) m_state = State::GzipCommentSkip;
+            else if ((m_gz_flg & 0x02u) != 0u) m_state = State::GzipHcrc;
+            else m_state = State::BlockHdr;
+            break;
+        }
+
+        case State::GzipExtraLen: {
+            u8 b = 0u;
+            while (m_tmp_pos < 2u && align_byte_pull(b)) {
+                m_tmp[m_tmp_pos++] = b;
+                m_gz_hcrc = crc32_update(m_gz_hcrc, ArrayRef<u8>(&b, 1u));
+            }
+            if (m_tmp_pos < 2u) return ErrorCode::Ok;
+            m_stored_rem = as<usize>(m_tmp[0]) | (as<usize>(m_tmp[1]) << 8u);
+            m_tmp_pos = 0u;
+            m_state = State::GzipExtraSkip;
+            break;
+        }
+
+        case State::GzipExtraSkip: {
+            u8 b = 0u;
+            while (m_stored_rem > 0u && align_byte_pull(b)) {
+                m_gz_hcrc = crc32_update(m_gz_hcrc, ArrayRef<u8>(&b, 1u));
+                --m_stored_rem;
+            }
+            if (m_stored_rem > 0u) return ErrorCode::Ok;
+            if ((m_gz_flg & 0x08u) != 0u) m_state = State::GzipNameSkip;
+            else if ((m_gz_flg & 0x10u) != 0u) m_state = State::GzipCommentSkip;
+            else if ((m_gz_flg & 0x02u) != 0u) m_state = State::GzipHcrc;
+            else m_state = State::BlockHdr;
+            break;
+        }
+
+        case State::GzipNameSkip: {
+            u8 b = 0u;
+            bool done = false;
+            while (align_byte_pull(b)) {
+                m_gz_hcrc = crc32_update(m_gz_hcrc, ArrayRef<u8>(&b, 1u));
+                if (b == 0u) { done = true; break; }
+            }
+            if (!done) return ErrorCode::Ok;
+            if ((m_gz_flg & 0x10u) != 0u) m_state = State::GzipCommentSkip;
+            else if ((m_gz_flg & 0x02u) != 0u) m_state = State::GzipHcrc;
+            else m_state = State::BlockHdr;
+            break;
+        }
+
+        case State::GzipCommentSkip: {
+            u8 b = 0u;
+            bool done = false;
+            while (align_byte_pull(b)) {
+                m_gz_hcrc = crc32_update(m_gz_hcrc, ArrayRef<u8>(&b, 1u));
+                if (b == 0u) { done = true; break; }
+            }
+            if (!done) return ErrorCode::Ok;
+            m_state = ((m_gz_flg & 0x02u) != 0u) ? State::GzipHcrc : State::BlockHdr;
+            break;
+        }
+
+        case State::GzipHcrc: {
+            u8 b = 0u;
+            while (m_tmp_pos < 2u && align_byte_pull(b)) m_tmp[m_tmp_pos++] = b;
+            if (m_tmp_pos < 2u) return ErrorCode::Ok;
+            const u16 exp = as<u16>(as<u16>(m_tmp[0]) | (as<u16>(m_tmp[1]) << 8u));
+            if (exp != as<u16>(m_gz_hcrc & 0xFFFFu)) return fail(ErrorCode::InvalidData);
+            m_tmp_pos = 0u;
+            m_state = State::BlockHdr;
+            break;
+        }
+
+        case State::BlockHdr: {
+            u32 hdr = 0u;
+            if (!take_bits(3, hdr)) return ErrorCode::Ok;
+            m_bfinal = (hdr & 1u) != 0u;
+            const u32 btype = hdr >> 1u;
+            if (btype == 0u) {
+                m_tmp_pos = 0u;
+                m_state = State::StoredHdr;
+            } else if (btype == 1u) {
+                u8 lit_lens[288];
+                for (i32 i = 0; i <= 143; ++i) lit_lens[i] = 8u;
+                for (i32 i = 144; i <= 255; ++i) lit_lens[i] = 9u;
+                for (i32 i = 256; i <= 279; ++i) lit_lens[i] = 7u;
+                for (i32 i = 280; i <= 287; ++i) lit_lens[i] = 8u;
+                u8 dist_lens[32];
+                for (i32 i = 0; i < 32; ++i) dist_lens[i] = 5u;
+                [[maybe_unused]] const ErrorCode e1 = m_lit_tree.build(lit_lens, 288);
+                [[maybe_unused]] const ErrorCode e2 = m_dist_tree.build(dist_lens, 32);
+                m_state = State::DecodeLitLen;
+            } else if (btype == 2u) {
+                m_state = State::DynHdr;
+            } else {
+                return fail(ErrorCode::InvalidData);
+            }
+            break;
+        }
+
+        case State::StoredHdr: {
+            u8 b = 0u;
+            while (m_tmp_pos < 4u && align_byte_pull(b)) m_tmp[m_tmp_pos++] = b;
+            if (m_tmp_pos < 4u) return ErrorCode::Ok;
+            const u16 blen = as<u16>(as<u16>(m_tmp[0]) | (as<u16>(m_tmp[1]) << 8u));
+            const u16 nlen = as<u16>(as<u16>(m_tmp[2]) | (as<u16>(m_tmp[3]) << 8u));
+            if (as<u16>(blen ^ 0xFFFFu) != nlen) return fail(ErrorCode::InvalidData);
+            m_stored_rem = as<usize>(blen);
+            m_tmp_pos = 0u;
+            m_state = State::StoredBody;
+            break;
+        }
+
+        case State::StoredBody: {
+            u8 b = 0u;
+            while (m_stored_rem > 0u && align_byte_pull(b)) {
+                const ErrorCode ec = emit_byte(b, out);
+                if (ec != ErrorCode::Ok) return ec;
+                --m_stored_rem;
+            }
+            if (m_stored_rem > 0u) return ErrorCode::Ok;
+            if (m_bfinal) {
+                m_tmp_pos = 0u;
+                if (m_format == StreamFormat::Zlib) m_state = State::ZlibTrailer;
+                else if (m_format == StreamFormat::Gzip) m_state = State::GzipTrailer;
+                else { m_finished = true; m_state = State::Done; }
+            } else {
+                m_state = State::BlockHdr;
+            }
+            break;
+        }
+
+        case State::DynHdr: {
+            u32 bits = 0u;
+            if (!take_bits(14, bits)) return ErrorCode::Ok;
+            m_hlit = as<i32>(bits & 0x1Fu) + 257;
+            m_hdist = as<i32>((bits >> 5u) & 0x1Fu) + 1;
+            m_hclen = as<i32>((bits >> 10u) & 0x0Fu) + 4;
+            if (m_hlit > 286 || m_hdist > 30) return fail(ErrorCode::InvalidData);
+            for (i32 i = 0; i < 19; ++i) m_cl_lens[i] = 0u;
+            m_cl_idx = 0;
+            m_state = State::DynClLens;
+            break;
+        }
+
+        case State::DynClLens: {
+            while (m_cl_idx < m_hclen) {
+                u32 v = 0u;
+                if (!take_bits(3, v)) return ErrorCode::Ok;
+                m_cl_lens[kCodeLengthOrder[m_cl_idx++]] = as<u8>(v);
+            }
+            const ErrorCode ec = m_cl_tree.build(m_cl_lens, 19);
+            if (ec != ErrorCode::Ok) return fail(ec);
+            for (i32 i = 0; i < 320; ++i) m_all_lens[i] = 0u;
+            m_lens_idx = 0;
+            m_pending_cl_sym = -1;
+            m_state = State::DynCodeLens;
+            break;
+        }
+
+        case State::DynCodeLens: {
+            const i32 total = m_hlit + m_hdist;
+            while (m_lens_idx < total) {
+                if (m_pending_cl_sym < 0) {
+                    i32 sym = 0;
+                    const i32 rc = decode_huff(m_cl_tree, sym);
+                    if (rc == 0) return ErrorCode::Ok;
+                    if (rc < 0) return fail(ErrorCode::InvalidData);
+                    if (sym < 16) {
+                        m_all_lens[m_lens_idx++] = as<u8>(sym);
+                        continue;
+                    }
+                    m_pending_cl_sym = sym;
+                }
+                const i32 sym = m_pending_cl_sym;
+                if (sym == 16) {
+                    if (m_lens_idx == 0) return fail(ErrorCode::InvalidData);
+                    u32 ex = 0u;
+                    if (!take_bits(2, ex)) return ErrorCode::Ok;
+                    const i32 rep = as<i32>(ex) + 3;
+                    if (m_lens_idx + rep > total) return fail(ErrorCode::InvalidData);
+                    const u8 prev = m_all_lens[m_lens_idx - 1];
+                    for (i32 r = 0; r < rep; ++r) m_all_lens[m_lens_idx++] = prev;
+                } else if (sym == 17 || sym == 18) {
+                    const i32 ebits = (sym == 17) ? 3 : 7;
+                    const i32 base = (sym == 17) ? 3 : 11;
+                    u32 ex = 0u;
+                    if (!take_bits(ebits, ex)) return ErrorCode::Ok;
+                    const i32 rep = as<i32>(ex) + base;
+                    if (m_lens_idx + rep > total) return fail(ErrorCode::InvalidData);
+                    for (i32 r = 0; r < rep; ++r) m_all_lens[m_lens_idx++] = 0u;
+                } else {
+                    return fail(ErrorCode::InvalidData);
+                }
+                m_pending_cl_sym = -1;
+            }
+            if (m_all_lens[256] == 0u) return fail(ErrorCode::InvalidData);
+            ErrorCode ec = m_lit_tree.build(m_all_lens, m_hlit);
+            if (ec != ErrorCode::Ok) return fail(ec);
+            ec = m_dist_tree.build(m_all_lens + m_hlit, m_hdist, true);
+            if (ec != ErrorCode::Ok) return fail(ec);
+            m_state = State::DecodeLitLen;
+            break;
+        }
+
+        case State::DecodeLitLen: {
+            i32 sym = 0;
+            const i32 rc = decode_huff(m_lit_tree, sym);
+            if (rc == 0) return ErrorCode::Ok;
+            if (rc < 0) return fail(ErrorCode::InvalidData);
+            if (sym < 256) [[likely]] {
+                const ErrorCode ec = emit_byte(as<u8>(sym), out);
+                if (ec != ErrorCode::Ok) return ec;
+            } else if (sym == 256) {
+                if (m_bfinal) {
+                    m_tmp_pos = 0u;
+                    if (m_format == StreamFormat::Zlib) m_state = State::ZlibTrailer;
+                    else if (m_format == StreamFormat::Gzip) m_state = State::GzipTrailer;
+                    else { m_finished = true; m_state = State::Done; }
+                } else {
+                    m_state = State::BlockHdr;
+                }
+            } else if (sym <= 285) {
+                m_pending_len_idx = sym - 257;
+                m_state = State::DecodeLenExtra;
+            } else {
+                return fail(ErrorCode::InvalidData);
+            }
+            break;
+        }
+
+        case State::DecodeLenExtra: {
+            const i32 ebits = kExtraLengthBits[m_pending_len_idx];
+            u32 ex = 0u;
+            if (ebits > 0 && !take_bits(ebits, ex)) return ErrorCode::Ok;
+            m_pending_length = as<usize>(kLengthBase[m_pending_len_idx]) + as<usize>(ex);
+            m_state = State::DecodeDist;
+            break;
+        }
+
+        case State::DecodeDist: {
+            i32 dsym = 0;
+            const i32 rc = decode_huff(m_dist_tree, dsym);
+            if (rc == 0) return ErrorCode::Ok;
+            if (rc < 0 || dsym < 0 || dsym >= 30) return fail(ErrorCode::InvalidData);
+            m_pending_dist_sym = dsym;
+            m_state = State::DecodeDistExtra;
+            break;
+        }
+
+        case State::DecodeDistExtra: {
+            const i32 ebits = kExtraDistBits[m_pending_dist_sym];
+            u32 ex = 0u;
+            if (ebits > 0 && !take_bits(ebits, ex)) return ErrorCode::Ok;
+            const usize dist = as<usize>(kDistBase[m_pending_dist_sym]) + as<usize>(ex);
+            const ErrorCode ec = emit_match(m_pending_length, dist, out);
+            if (ec != ErrorCode::Ok) return ec;
+            m_state = State::DecodeLitLen;
+            break;
+        }
+
+        case State::ZlibTrailer: {
+            u8 b = 0u;
+            while (m_tmp_pos < 4u && align_byte_pull(b)) m_tmp[m_tmp_pos++] = b;
+            if (m_tmp_pos < 4u) return ErrorCode::Ok;
+            const u32 exp_adler = (as<u32>(m_tmp[0]) << 24u) | (as<u32>(m_tmp[1]) << 16u) |
+                                  (as<u32>(m_tmp[2]) << 8u) | as<u32>(m_tmp[3]);
+            if (exp_adler != m_adler) return fail(ErrorCode::InvalidData);
+            m_finished = true;
+            m_state = State::Done;
+            break;
+        }
+
+        case State::GzipTrailer: {
+            u8 b = 0u;
+            while (m_tmp_pos < 8u && align_byte_pull(b)) m_tmp[m_tmp_pos++] = b;
+            if (m_tmp_pos < 8u) return ErrorCode::Ok;
+            const u32 exp_crc = as<u32>(m_tmp[0]) | (as<u32>(m_tmp[1]) << 8u) |
+                                (as<u32>(m_tmp[2]) << 16u) | (as<u32>(m_tmp[3]) << 24u);
+            const u32 exp_isize = as<u32>(m_tmp[4]) | (as<u32>(m_tmp[5]) << 8u) |
+                                  (as<u32>(m_tmp[6]) << 16u) | (as<u32>(m_tmp[7]) << 24u);
+            if (exp_crc != m_crc || exp_isize != as<u32>(as<u64>(m_member_out) & 0xFFFFFFFFull)) {
+                return fail(ErrorCode::InvalidData);
+            }
+            m_finished = true;
+            m_state = State::GzipNextMember;
+            break;
+        }
+
+        case State::GzipNextMember: {
+            u8 b = 0u;
+            if (!align_byte_pull(b)) return ErrorCode::Ok;
+            // Start of next concatenated GZIP member
+            reset_for_next_gzip_member();
+            m_tmp[0] = b;
+            m_tmp_pos = 1u;
+            m_gz_hcrc = crc32_update(0u, ArrayRef<u8>(&b, 1u));
+            break;
+        }
+
+        case State::Done:
+            return ErrorCode::Ok;
+
+        case State::Failed:
+            return m_error;
+        }
+    }
+}
+
+ErrorCode InflateStream::finish() noexcept {
+    if (m_error != ErrorCode::Ok) return m_error;
+    if (!m_finished) {
+        m_error = ErrorCode::EndOfFile;
+        m_state = State::Failed;
+        return m_error;
+    }
+    return ErrorCode::Ok;
+}
+
 } // namespace keel::compress
