@@ -128,7 +128,9 @@ Array<u8> gzip_compress(ArrayRef<u8> src, const GzipOptions& opts) {
     Array<u8> out(alloc);
     out.reserve((src.size() / 2u) + 64u);
 
+    const usize xlen = keel::min<usize>(opts.extra.size(), 65535u);
     u8 flg = 0u;
+    if (xlen > 0u) flg = as<u8>(flg | kFlgFextra);
     if (!opts.filename.empty()) flg = as<u8>(flg | kFlgFname);
     if (!opts.comment.empty()) flg = as<u8>(flg | kFlgFcomment);
     if (opts.write_header_crc) flg = as<u8>(flg | kFlgFhcrc);
@@ -140,6 +142,11 @@ Array<u8> gzip_compress(ArrayRef<u8> src, const GzipOptions& opts) {
     push_le32(out, opts.mtime);
     out.push_back((opts.level >= 9) ? 0x02u : ((opts.level <= 1) ? 0x04u : 0x00u));
     out.push_back(opts.os);
+
+    if (xlen > 0u) {
+        push_le16(out, as<u16>(xlen));
+        out.append(opts.extra.slice(0u, xlen));
+    }
 
     if (!opts.filename.empty()) {
         for (usize i = 0u; i < opts.filename.size(); ++i) {

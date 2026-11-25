@@ -15,6 +15,7 @@ struct GzipOptions {
     u8 os = 0xFFu;
     StringRef filename{};
     StringRef comment{};
+    ArrayRef<u8> extra{};
     bool write_header_crc = false;
     Allocator* allocator = nullptr;
 };

@@ -144,8 +144,44 @@ void test_deflate_zlib_and_streaming() {
         TEST_CHECK(zd.is_ok() && *zd == big);
     }
 
-    // Streaming DeflateStream (ZLIB + GZIP + Raw) with irregular chunks
+    // Fibonacci-distributed symbols (shuffled to defeat LZ77) force Huffman depth > 15
+    // and exercise Kraft-balanced length limiting in build_huffman_lengths().
+    {
+        Array<u8> fib_payload;
+        u32 f0 = 1u;
+        u32 f1 = 1u;
+        for (u32 sym = 0u; sym < 20u; ++sym) {
+            for (u32 c = 0u; c < f0; ++c) fib_payload.push_back(as<u8>(sym));
+            const u32 fn = f0 + f1;
+            f0 = f1;
+            f1 = fn;
+        }
+        // Deterministic Fisher-Yates shuffle
+        u32 srng = 0x55AA33CCu;
+        for (usize i = fib_payload.size() - 1u; i > 0u; --i) {
+            srng = srng * 1664525u + 1013904223u;
+            const usize j = as<usize>(srng) % (i + 1u);
+            const u8 tmp = fib_payload[i];
+            fib_payload[i] = fib_payload[j];
+            fib_payload[j] = tmp;
+        }
+        Array<u8> fib_z = zlib_compress(fib_payload, 6);
+        auto fib_d = zlib_decompress(fib_z);
+        TEST_CHECK(fib_d.is_ok() && *fib_d == fib_payload);
+    }
+
+    // Streaming DeflateStream (ZLIB + GZIP + Raw) with irregular chunks AND empty stream
     for (StreamFormat fmt : {StreamFormat::Raw, StreamFormat::Zlib, StreamFormat::Gzip}) {
+        // Empty stream (finish() without update())
+        {
+            DeflateStream empty_ds(fmt, 6);
+            Array<u8> empty_comp = empty_ds.finish();
+            Result<Array<u8>> empty_dec = (fmt == StreamFormat::Raw)
+                ? inflate_raw(empty_comp)
+                : ((fmt == StreamFormat::Zlib) ? zlib_decompress(empty_comp) : gzip_decompress(empty_comp));
+            TEST_CHECK(empty_dec.is_ok() && empty_dec->empty());
+        }
+
         DeflateStream ds(fmt, 6);
         Array<u8> streamed;
         for (usize off = 0u; off < big.size(); off += 11111u) {
@@ -189,12 +225,14 @@ void test_gzip_rfc1952() {
     ArrayRef<u8> b1(reinterpret_cast<const u8*>(s1.data()), s1.size());
     ArrayRef<u8> b2(reinterpret_cast<const u8*>(s2.data()), s2.size());
 
+    const u8 extra_bytes[] = {'K', 'L', 0x02u, 0x00u, 0xCAu, 0xFEu};
     GzipOptions gopts{};
     gopts.level = 6;
     gopts.mtime = 1700000000u;
     gopts.os = 3u;
     gopts.filename = "report.txt";
     gopts.comment = "keel::compress gzip test";
+    gopts.extra = ArrayRef<u8>(extra_bytes, sizeof(extra_bytes));
     gopts.write_header_crc = true;
 
     Array<u8> gz1 = gzip_compress(b1, gopts);
@@ -205,6 +243,7 @@ void test_gzip_rfc1952() {
         TEST_CHECK(hdr->os == 3u);
         TEST_CHECK(hdr->filename.as_ref() == "report.txt");
         TEST_CHECK(hdr->comment.as_ref() == "keel::compress gzip test");
+        TEST_CHECK(hdr->extra == ArrayRef<u8>(extra_bytes, sizeof(extra_bytes)));
     }
 
     auto dec1 = gzip_decompress(gz1);
@@ -296,6 +335,16 @@ void test_lz4_block_and_frame() {
     with_skip.append(fr_tiny.as_ref());
     auto skip_dec = lz4_frame_decompress(with_skip);
     TEST_CHECK(skip_dec.is_ok() && *skip_dec == tiny_b);
+
+    // Concatenated LZ4 frames + cumulative max_output_bytes enforcement
+    Array<u8> f_a = lz4_frame_compress(ArrayRef<u8>(big.data(), 4000u));
+    Array<u8> f_b = lz4_frame_compress(ArrayRef<u8>(big.data() + 4000u, 4000u));
+    Array<u8> concat_lz4 = f_a.clone();
+    concat_lz4.append(f_b.as_ref());
+    auto concat_dec = lz4_frame_decompress(concat_lz4);
+    TEST_CHECK(concat_dec.is_ok() && *concat_dec == big.slice(0u, 8000u));
+    TEST_CHECK(lz4_frame_decompress(concat_lz4, InflateOptions{.max_output_bytes = 6000u}).error().code ==
+               ErrorCode::OutOfRange);
 
     // Decompression bomb cap on LZ4 Frame
     Array<u8> zeros(128u * 1024u, u8{0u});

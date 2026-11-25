@@ -71,11 +71,11 @@ usize block_max_bytes(Lz4BlockSize bs) noexcept {
 }
 
 ErrorCode lz4_decompress_block_into(ArrayRef<u8> src, Array<u8>& out,
-                                      usize max_output_bytes, bool allow_dict_history) {
+                                      usize max_output_bytes, usize dict_base_size) {
     const u8* ip = src.data();
     const usize src_len = src.size();
     usize pos = 0u;
-    const usize base_size = allow_dict_history ? 0u : out.size();
+    const usize base_size = dict_base_size;
 
     auto exceeds_cap = [&](usize add_bytes) noexcept -> bool {
         if (max_output_bytes == 0u) return false;
@@ -176,8 +176,8 @@ Array<u8> lz4_compress_block(ArrayRef<u8> src, Allocator* alloc) {
     }
 
     ArenaTemp scratch = get_scratch(dst_alloc);
-    u32* table = scratch.arena().alloc_array<u32>(kHashTableSize);
-    mem_zero(table, kHashTableSize * sizeof(u32));
+    usize* table = scratch.arena().alloc_array<usize>(kHashTableSize);
+    mem_zero(table, kHashTableSize * sizeof(usize));
 
     const usize mf_limit = len - kMfLimit;
     const usize match_limit = len - kLastLiterals;
@@ -191,8 +191,8 @@ Array<u8> lz4_compress_block(ArrayRef<u8> src, Allocator* alloc) {
     while (pos <= mf_limit) {
         const u32 cur_val = load_le32(ip + pos);
         const usize h = lz4_hash4(cur_val);
-        const usize ref = as<usize>(table[h]);
-        table[h] = as<u32>(pos);
+        const usize ref = table[h];
+        table[h] = pos;
 
         const usize dist = pos - ref;
         if (dist == 0u || dist > kMaxDist || load_le32(ip + ref) != cur_val) {
@@ -222,7 +222,7 @@ Array<u8> lz4_compress_block(ArrayRef<u8> src, Allocator* alloc) {
         if (pos > mf_limit) break;
 
         // Update hash at pos - 2 for better chaining
-        table[lz4_hash4(load_le32(ip + pos - 2u))] = as<u32>(pos - 2u);
+        table[lz4_hash4(load_le32(ip + pos - 2u))] = pos - 2u;
     }
 
     // Emit final literals (always required when anchor < len)
@@ -237,7 +237,7 @@ Array<u8> lz4_compress_block(ArrayRef<u8> src, Allocator* alloc) {
 Result<Array<u8>> lz4_decompress_block(ArrayRef<u8> src, usize max_output_bytes, Allocator* alloc) {
     Allocator* dst_alloc = alloc ? alloc : default_allocator();
     Array<u8> out(dst_alloc);
-    const ErrorCode ec = lz4_decompress_block_into(src, out, max_output_bytes, false);
+    const ErrorCode ec = lz4_decompress_block_into(src, out, max_output_bytes, 0u);
     if (ec != ErrorCode::Ok) [[unlikely]] return ec;
     return out;
 }
@@ -366,7 +366,9 @@ Result<Array<u8>> lz4_frame_decompress(ArrayRef<u8> src, const InflateOptions& o
             if (src.size() - pos < 8u) [[unlikely]] return ErrorCode::EndOfFile;
             expected_content_size = load_le64(src.data() + pos);
             pos += 8u;
-            if (opts.max_output_bytes > 0u && expected_content_size > as<u64>(opts.max_output_bytes)) [[unlikely]] {
+            if (opts.max_output_bytes > 0u &&
+                (out.size() > opts.max_output_bytes ||
+                 expected_content_size > as<u64>(opts.max_output_bytes - out.size()))) [[unlikely]] {
                 return ErrorCode::OutOfRange;
             }
         }
@@ -422,7 +424,8 @@ Result<Array<u8>> lz4_frame_decompress(ArrayRef<u8> src, const InflateOptions& o
                 const usize block_cap = (opts.max_output_bytes > 0u)
                     ? keel::min<usize>(opts.max_output_bytes, blk_out_before + max_blk)
                     : (blk_out_before + max_blk);
-                const ErrorCode ec = lz4_decompress_block_into(blk_data, out, block_cap, !block_indep);
+                const usize dict_base = block_indep ? blk_out_before : frame_out_start;
+                const ErrorCode ec = lz4_decompress_block_into(blk_data, out, block_cap, dict_base);
                 if (ec != ErrorCode::Ok) [[unlikely]] return ec;
             }
         }

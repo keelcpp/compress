@@ -192,8 +192,12 @@ Result<Array<u8>> ZipReader::extract(usize index, const InflateOptions& opts) co
     }
     const u16 l_name_len = load_le16(lhdr + 26u);
     const u16 l_extra_len = load_le16(lhdr + 28u);
-    const usize data_off = loff + 30u + as<usize>(l_name_len) + as<usize>(l_extra_len);
-    if (data_off > m_archive.size() || m_archive.size() - data_off < as<usize>(e.compressed_size)) [[unlikely]] {
+    const usize l_hdr_size = 30u + as<usize>(l_name_len) + as<usize>(l_extra_len);
+    if (m_archive.size() - loff < l_hdr_size) [[unlikely]] {
+        return ErrorCode::EndOfFile;
+    }
+    const usize data_off = loff + l_hdr_size;
+    if (m_archive.size() - data_off < as<usize>(e.compressed_size)) [[unlikely]] {
         return ErrorCode::EndOfFile;
     }
 

@@ -155,6 +155,14 @@ def make_payloads():
         for i in range(sz):
             buf[i] = (i % 29) ^ (rng.randrange(256) if (i % 7 == 0) else 0)
         payloads.append((f"edge_{sz}", bytes(buf)))
+    # Fibonacci frequency distribution (depth > 15 forces length-limited Huffman)
+    fib_buf = bytearray()
+    f0, f1 = 1, 1
+    for sym in range(20):
+        fib_buf.extend(bytes([sym]) * f0)
+        f0, f1 = f1, f0 + f1
+    rng.shuffle(fib_buf)
+    payloads.append(("fibonacci_depth19", bytes(fib_buf)))
     return payloads
 
 total_checks = 0
@@ -280,6 +288,32 @@ try:
         with open(f_out, "rb") as f:
             assert f.read() == exp, f"py zipfile -> keel ZipReader mismatch on {ename}"
         total_checks += 1
+
+    # Streaming ZIP with Data Descriptor (bit 3 set, zeros in Local File Header)
+    class NonSeekableWriter(io.RawIOBase):
+        def __init__(self):
+            self.buf = bytearray()
+        def writable(self):
+            return True
+        def seekable(self):
+            return False
+        def write(self, b):
+            self.buf.extend(b)
+            return len(b)
+
+    nsw = NonSeekableWriter()
+    with zipfile.ZipFile(nsw, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("streamed/data_desc.bin", payloads[4][1])
+    with open(f_zip, "wb") as f:
+        f.write(bytes(nsw.buf))
+    with zipfile.ZipFile(f_zip, "r") as zf:
+        assert (zf.getinfo("streamed/data_desc.bin").flag_bits & 0x08) != 0
+    with open(f_name, "wb") as f:
+        f.write(b"streamed/data_desc.bin")
+    run_keel("--zip-extract", f_zip, f_name, f_out)
+    with open(f_out, "rb") as f:
+        assert f.read() == payloads[4][1], "ZIP bit-3 Data Descriptor extraction mismatch"
+    total_checks += 1
 
     # 5. LZ4 Frame (keel -> independent pure-Python spec decoder + round-trip)
     for name, data in payloads[:10]:
